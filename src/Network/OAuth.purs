@@ -4,7 +4,7 @@ import Prelude
 import App.Data.Jwt as Jwt
 import App.Data.Aff (hushAff)
 import App.Formatting (messages)
-import App.Network.OAuth.Type (AccessTokenResponse, AccessTokenResponseSuccess(..), CertsResponse, ValidateTokenResponse)
+import App.Network.OAuth.Type (TokenEndpointSuccessResponse, AccessTokenResponseSuccess(..), CertsResponse, ValidateTokenResponse)
 import Control.Alt ((<|>))
 import Control.Monad.Aff (Aff)
 import Control.Monad.Eff (Eff)
@@ -72,8 +72,8 @@ data ClientWithAuthentication =
 -- https://tools.ietf.org/html/rfc6749#section-3
 
 -- Auth server endpoints
-type AuthorizationEndpoint = String -- m AuthorizationToken
-type TokenEndpoint = String -- AuthorizationToken -> m AccessToken
+newtype AuthorizationEndpoint = AuthorizationEndpoint String
+newtype TokenEndpoint = TokenEndpoint String
 
 -- Client endpoints
 type ClientTokenReceptionEndpoint = String
@@ -101,10 +101,11 @@ type ClientTokenReceptionEndpoint = String
 -- Authorization Server must return AuthorizationServerErrorResponse
 --   if no response type received.
 
-data AuthorizationEndpointResponseType =
-    AuthorizationCode -- authorization flow
-  | AccessToken -- implicit grant flow
-  -- | CustomResponseType String -- ignore for now
+-- ??? Delete?
+-- data AuthorizationEndpointResponseType =
+--     AuthorizationCode -- authorization flow
+--   | AccessToken -- implicit grant flow
+--   -- | CustomResponseType String -- ignore for now
 
 -- 3.1.2: Authorization Endpoint Redirection
 -- https://tools.ietf.org/html/rfc6749#section-3.1.2
@@ -177,12 +178,131 @@ newtype AccessScope = AccessScope (Set String)
 -- - Client Credentials
 -- - Custom (extension)
 
+data AuthorizationGrantType
+  = AuthorizationCode
+  | Implicit
+  | ResourceOwnerPasswordCreds
+  | ClientCredentials
+  -- | Custom -- Implement when have use-case
+
 -- 4.1: Obtaining Authorization
 -- https://tools.ietf.org/html/rfc6749#section-4.1
 
--- Client must be capable of receiving incoming requests
+-- Client must be capable of receiving incoming HTTP request
 --  and interacting with the resource owner's user-agent
 --  to obtain an authorization code grant.
+
+newtype AuthRequest (responseType :: AuthorizationRequestType) =
+  AuthRequest
+    -- AuthorizationEndpoint ??? Include in data type?
+    (AuthRequestArgs responseType)
+    (AuthRequestArgs responseType -> Eff eff Unit)
+    -- ^ Spawn browser or child window to send user-agent to authorization server.
+    ((Either AuthorizationEndpointErrorResponse (AuthorizationEndpointSuccessResponse responseType) -> Eff eff Unit)
+      -> Eff eff Unit
+    )
+    -- ^ Listen for HTTP request or child window event having authorization token.
+
+reqAuthServer ::
+  forall eff responseType.
+     AuthRequest responseType
+  -> (Either AuthorizationEndpointErrorResponse (AuthorizationEndpointSuccessResponse responseType) -> Eff eff Unit)
+  -> Eff eff Unit
+reqAuthServer
+  (AuthRequest
+    client_id redirect_uri
+    scope state
+    openAuth listenForAuth
+  ) handleResponse = do
+  openAuth authReq
+  listenForAuth handleResponse
+  where
+    authReq = AuthRequestArgs client_id redirect_uri scope state
+
+reqAuthServer'
+  :: forall eff responseType.
+     AuthRequest responseType
+  -> ContT Unit (Eff eff)
+       (Either (AuthorizationEndpointErrorResponse (AuthorizationEndpointSuccessResponse responseType)))
+reqAuthServer' authRequest =
+  ContT $ reqAuthServer authRequest
+
+authRequestForCLIApp ::
+  forall eff responseType.
+     ClientId
+  -> RedirectURI
+  -> Maybe AccessTokenScope
+  -> Maybe CSRFStateToken
+  -> AuthRequest responseType
+authRequestForCLIApp client_id redirect_uri scope state =
+  AuthRequest
+    client_id redirect_uri
+    scope state
+    spawnBrowser listenForAuth
+  where
+    spawnBrowser :: AuthRequestArgs responsetype -> Eff (cp :: CHILD_PROCESS | eff) ChildProcess
+    spawnBrowser authRequest =
+        ChildProcess.spawn (fst openCmd)
+          (snd openCmd <> print <<< authReqAsQuery authReq)
+          defaultSpawnOptions
+        where
+          authReqAsQuery :: AuthRequestArgs responseType -> Query
+          authReqAsQuery (AuthRequestArgs client_id
+            redirect_uri scope state) = Query
+              Cons (Tuple "request_type" $ Just "code") -- !!! token?
+                $ Cons (Tuple "client_id" $ Just client_id)
+                $ Cons (Tuple "redirect_uri" $ Just redirect_uri)
+                $ Nil
+                <> (maybe mempty (\scope' -> Tuple "scope" $ Just scope') scope)
+                <> (maybe mempty (\state' -> Tuple "state" $ Just state') state)
+          openCmd = Desktops.browserOpenCmdForDesktop
+              $ mostCommonDesktopForPlatform $ fromMaybe Linux platform
+    listenForAuth ::
+      (Either AuthorizationEndpointErrorResponse (AuthorizationEndpointSuccessResponse tokenType)
+        -> Eff eff Unit
+      )
+      -> Eff eff Unit
+    listenForAuth cb = do
+      server <- createServer $ listenHandler cb
+      !!! Move to util, consider using lens instead.
+      let portFromUri (URI _ (HierarchicalPart maybeAuthority) _) _ _) =
+            maybeAuthority >>= firstPortFromAuthority
+              where
+                portFromPair (Tuple _ maybePort) = maybePort
+                firstPortFromAuthority (Authority _ hostPorts) =
+                  head hostPorts >>= portFromPair
+      -- !!! Clean up server when done.
+      listen server
+          { hostname: "localhost"
+          , port: portFromUri redirect_uri
+          , backlog: Nothing
+          } $ void do
+        log "Listening on port 8080 at " <> print redirect_uri
+          <> " for Authorization Token."
+      where
+        listenHandler cb' req res = do
+          -- log (requestMethod req <> " " <> requestURL req)
+          let outputStream = responseAsStream res
+          let parsedUri = parse $ requestURL req
+          case requestMethod req, parsedUri of
+            "GET" url, Right uri@(URI _ h (Just query) _) -> do
+               when $ 0 == indexOf (print redirect_uri) (print h)
+               let authRes = authResponseFromQuery query
+               _ <- cb' $ Right authRes
+               setStatusCode res 200
+               end outputStream (pure unit)
+            -- !!! Better error messages
+            _, _ -> unsafeCrashWith "Failed to receive authorization token."
+               setStatusCode res 400
+               end outputStream (pure unit)
+        authResponseFromQuery :: Query -> Either String (AuthorizationEndpointSuccessResponse tokenType)
+        authResponseFromQuery (Query kvs) =
+          (find "code" kvs # note "No authorization code in response")
+          >>= parseAuthTokenRequestCode
+          <$>
+          (\code ->
+            AuthorizationEndpointSuccessResponse $ Tuple code (find "state" kvs)
+          )
 
 -- 4.1.1: Authorization Request
 -- https://tools.ietf.org/html/rfc6749#section-4.1.1
@@ -190,38 +310,99 @@ newtype AccessScope = AccessScope (Set String)
 -- Client sends request to Authorization Endpoint having params:
 -- - `response_type`: value="code"
 -- - `client_id`
--- - `redirect_uri`: the URI on which the client listens to receive grant
+-- - `redirect_uri`: optional, the URI on which the client listens to receive grant
 -- - `scope`: optional, the scope of the access request
 -- - `state`: recommended, to prevent XSRF, client should verify
 --      value unchanged between requesting authorization and receiving grant
+
+const_auth_request_type_token :: String
+const_auth_request_type_token = "token"
+const_auth_request_type_code :: String
+const_auth_request_type_code = "code"
+
+foreign import kind AuthorizationRequestType
+foreign import AuthorizationCode :: AuthorizationRequestType
+foreign import AccessToken :: AuthorizationRequestType
+
+foreign import AuthorizationRequestTypeToken :: AuthorizationRequestType -> Type
+authTokenRequestCode :: AuthorizationRequestTypeToken -> String
+authTokenRequestCode AuthorizationCode = "code"
+authTokenRequestCode AccessToken = "token"
+parseAuthTokenRequestCode ::
+  String -> Either String AuthorizationRequestTypeToken
+parseAuthTokenRequestCode str = case str of
+  "code" -> Right AuthorizationCode
+  "token" -> Right AccessToken
+  _ -> Left "Unknown token type in authorization endpoint response."
+
+
+newtype CSRFStateToken = CSRFStateToken String
+
+-- `RedirectURI` is optional in the OAuth 2.0 spec as a convenience for
+--   clients having registered only a single redirect URI
+--   optional as a convenience to clients registering a single,
+--   non-partial redirect URI.
+--   To simplify our client, we simply always require it.
+data AuthRequestArgs (requestType :: AuthorizationRequestType)
+  = AuthorizationRequest
+    (AuthorizationRequestTypeToken requestType)
+    ClientId
+    RedirectURI
+    (Maybe AccessTokenScope)
+    (Maybe CSRFStateToken)
+
+authcodeAuthRequestArgs ::
+     ClientId
+  -> RedirectURI
+  -> Maybe AccessTokenScope
+  -> Maybe CSRFStateToken
+  -> AuthRequestArgs AuthorizationCode
+authcodeAuthRequestArgs client_id redirect_uri scope state =
+  AuthorizationRequest
+    (AuthorizationRequestTypeToken AuthorizationCode) client_id redirect_uri scope state
 
 -- 4.1.2: Authorization Response
 -- https://tools.ietf.org/html/rfc6749#section-4.1.2
 
 -- Authorization Server
---  Responds to authorization success with:
---  - `code`: must have short expiration (rec. <10 min),
---      client must use only once
---  - `state`: must be identical to `state` param received from client
+--  Responds to authorization success with HTTP redirect response
+--    containing the following params in the URI:
+--   - `code`: must have short expiration (rec. <10 min),
+--       client must use only once
+--   - `state`: must be identical to `state` param received from client
 --  Must not redirect to invalid redirection URI
 --  Should inform resource owner of erroneous request
---  Responds to authorization denial with:
---  - `error`: one of:
---    - `invalid_request`
---    - `unauthorized_client`
---    - `access_denied`
---    - `unsupported_response_type`
---    - `invalid_scope`
---    - `server_error`
---    - `temporarily_unavailable`
---  - `error_description`: optional, details in ASCII to assist developer
---  - `error_uri`: optional, URI of web page about the error
---  - `state`: must be identical to `state` param received from client
+-- Responds to authorization error with `AuthorizationEndpointErrorResponse`
+
+newtype AuthorizationEndpointSuccessResponse (tokenType :: AuthorizationRequestType)
+  = AuthorizationEndpointSuccessResponse
+    (Tuple (AuthorizationRequestTypeToken tokenType) (Maybe CSRFStateToken))
+
+data AuthorizationEndpointErrorCode
+  = InvalidRequest -- invalid_request
+  | UnauthorizedClient -- unauthorized_client
+  | AccessDenied -- access_denied
+  | UnsupportedResponseType -- unsupported_response_type
+  | InvalidScope -- invalid_scope
+  | ServerError -- server_error
+  | TemporarilyUnavailable -- temporarily_unavailable
+
+-- !!! Check code to ensure this is handled properly.
+
+data AuthorizationEndpointErrorResponse a =
+  { error :: AuthorizationEndpointErrorCode
+  , error_description :: NullOrUndefined String
+  -- ^ optional, details in ASCII to assist client dev
+  , error_uri :: NullOrUndefined String -- !!! URI, not String
+  -- ^ optional, URI of web page about the error
+  , state :: NullOrUndefined CSRFStateToken
+  -- ^ required if `state` was in request. Must be identical
+  }
 
 -- Client:
 --  - must ignore unrecognized response params
 
--- 4.1.3: Authorization Request
+-- 4.1.3: Access Token Request
 -- https://tools.ietf.org/html/rfc6749#section-4.1.3
 
 -- Client sends request to Token Endpoint having params:
@@ -231,8 +412,33 @@ newtype AccessScope = AccessScope (Set String)
 --      in authorization request. Must be identical to that one.
 --  - `client_id`: required only if didn't authenticate with Authorization Server
 
+--foreign import kind TokenRequestType
+--foreign import AuthorizationCode :: TokenRequestType
+--foreign import AccessToken :: TokenRequestType
+
+data TokenRequest (requestType :: TokenRequestType)
+  = TokenRequest
+    ClientId
+    RedirectURI
+    (Maybe AccessTokenScope)
+    (Maybe CSRFStateToken)
+
+tokenRequest ::
+     ClientId
+  -> RedirectURI
+  -> Maybe AccessTokenScope
+  -> Maybe CSRFStateToken
+  -> TokenRequest AuthorizationCode
+tokenRequest client_id redirect_uri scope state =
+  TokenRequest
+    client_id redirect_uri scope state
+
+sendRequest :: forall a. TokenRequest a
+sendRequest 
+
 -- If client is confidential or the client was issued client credentials
 --   or similar, the client must authenticate with Authorization Server.
+-- !!! Enforce this with types.
 
 -- Authentication Server must:
 --  - require client authentication for confidential clients or
@@ -248,18 +454,99 @@ newtype AccessScope = AccessScope (Set String)
 -- 4.1.4: Access Token Response
 -- https://tools.ietf.org/html/rfc6749#section-4.1.4
 
--- If request is valid and authorized, responds with AccessTokenResponse
--- 
+-- If request is valid and authorized, responds with `TokenEndpointSuccessResponse`,
+--  else responds with `TokenEndpointErrorResponse`.
+
+
+tokenByAuthorizationtoken ::
+     AuthRequest
+  -> TokenRequest
+  -> Aff _ (Either TokenEndpointErrorResponse TokenEndpointSuccessResponse)
+tokenByAuthorizationToken
+  (AuthRequest)
+  (TokenRequest)
+  = do
+  let authUri
+  reqAuth
+
+----------
+
+-- 4.2: Implicit Grant
+-- https://tools.ietf.org/html/rfc6749#section-4.2
+
+-- Implicit grant type obtains an access token (no refresh token).
+--   It is optimized for public clients using a particular redirection URI,
+--   which is typically an in-browser JavaScript app.
+-- No client authentication, requires resource owner to authenticate,
+--   and a preregistered redirection URI.
+
+-- 4.2.1: Authorization Request
+
+-- Client sends request to Authorization Endpoint having params:
+-- - `response_type`: value="token"
+-- - `client_id`
+-- - `redirect_uri`: optional, the URI on which the client listens to receive grant
+-- - `scope`: optional, the scope of the access request
+-- - `state`: recommended, to prevent XSRF, client should verify
+--      value unchanged between requesting authorization and receiving grant
+
+implicitAuthRequestArgs ::
+     ClientId
+  -> RedirectURI
+  -> Maybe AccessTokenScope
+  -> Maybe CSRFStateToken
+  -> AuthRequestArgs AccessToken
+implicitAuthRequestArgs client_id redirect_uri scope state =
+  AuthorizationRequest
+    (AuthorizationRequestTypeToken AccessToken) client_id redirect_uri scope state
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 -- 5.1 Successful Response
 -- https://tools.ietf.org/html/rfc6749#section-5.1
 
-data AccessTokenResponse a =
-  { access_token :: a
+data TokenEndpointSuccessResponse a =
+  { access_token :: a -- See 7.1: Access Token Types
   , token_type :: AccessTokenType
   , expires_in :: NullOrUndefined Seconds -- recommended
   , refresh_token :: NullOrUndefined RefreshToken
   , scope :: NullOrUndefined AccessScope
+  }
+
+-- 5.2 Error Response
+-- https://tools.ietf.org/html/rfc6749#section-5.2
+
+-- Rendered as ASCII string
+data TokenEndpointErrorCode
+  = InvalidRequest -- invalid_request
+  | InvalidClient -- invalid_client
+  | InvalidGrant -- invalid_grant
+  | UnauthorizedClient -- unauthorized_client
+  | UnsupportedGrantType -- unsupported_grant_type
+  | InvalidScope -- invalid_scope
+
+data TokenEndpointErrorResponse a =
+  { error :: TokenEndpointErrorCode
+  , error_description :: NullOrUndefined String
+  -- ^ optional, details in ASCII to assist client dev.
+  , error_uri :: NullOrUndefined String -- !!! URI, not String
+  -- ^ optional, URI of web page about the error
   }
 
 
@@ -320,16 +607,16 @@ freshToken oauthHost
         else traceAny "Session expired" \_ -> throwError $ error "Session expired."
     refreshSession :: Aff _ (Tuple String String)
     refreshSession = freshSession >>= formatResponse
-    freshSession :: Aff _ AccessTokenResponse
+    freshSession :: Aff _ TokenEndpointSuccessResponse
     freshSession =
       getTokenByRefresh oauthHost { client_id, client_secret, refresh_token: refreshToken }
-    formatResponse :: AccessTokenResponse -> Aff _ (Tuple String String)
+    formatResponse :: TokenEndpointSuccessResponse -> Aff _ (Tuple String String)
     formatResponse = either
         (\_ ->
           traceAny "Failed to refresh session" \_ ->
           throwError $ error "Failed to refresh session."
         )
-        (\(AccessTokenResponseSuccess r) ->
+        (\(TokenEndpointSuccessResponseSuccess r) ->
           traceAny "Refreshed session" \_ ->
           pure $ Tuple r.access_token r.refresh_token
         )
@@ -420,7 +707,7 @@ requestAccessTokenFromCode config clientState authRedirectUri code = do
 getTokenByPassword :: forall eff.
   String -> -- host
   { client_id :: String, client_secret :: Maybe String, username :: String, password :: String } ->
-  Aff (ajax :: AJAX | eff) AccessTokenResponse
+  Aff (ajax :: AJAX | eff) TokenEndpointSuccessResponse
 getTokenByPassword host tokenRequest =
   do
     traceAnyM "getToken opts"
@@ -449,7 +736,7 @@ getTokenByPassword host tokenRequest =
 getTokenByRefresh :: forall eff.
   String -> -- host
   { client_id :: String, client_secret :: Maybe String, refresh_token :: String } ->
-  Aff (ajax :: AJAX | eff) AccessTokenResponse
+  Aff (ajax :: AJAX | eff) TokenEndpointSuccessResponse
 getTokenByRefresh host tokenRequest = do
   res <- affjax opts
   traceAnyM "res"
@@ -474,7 +761,7 @@ getTokenByRefresh host tokenRequest = do
 getTokenByClientCredentials :: forall eff.
   String -> -- host
   { client_id :: String, client_secret :: Maybe String } ->
-  Aff (ajax :: AJAX | eff) AccessTokenResponse
+  Aff (ajax :: AJAX | eff) TokenEndpointSuccessResponse
 getTokenByClientCredentials host tokenRequest = do
   res <- affjax opts
   traceAnyM "res"
